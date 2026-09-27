@@ -1,0 +1,16 @@
+cd "D:\Amazon ML Challenge"
+
+@"
+venv/
+__pycache__/
+*.pyc
+
+dataset/
+output/
+training_data/
+
+.env
+
+*.log
+.ipynb_checkpoints/
+"@ | Set-Content .gitignore

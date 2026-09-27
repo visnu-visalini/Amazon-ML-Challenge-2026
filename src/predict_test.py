@@ -1,476 +1,405 @@
-import gc
-from pathlib import Path
+"""
+Production prediction pipeline for Amazon ML Challenge 2026.
+Generates candidate matches from Source 2 and Source 3 for Source 1.
 
-import lightgbm as lgb
+Pipeline:
+1. Country hard blocking + name2 / address12 candidate generation.
+2. Fast Candidate Gate (LightGBM, 10 fast features) at threshold >= 0.10.
+3. Full 12-feature calculation on gate survivors.
+4. Main Entity Matcher (LightGBM, 12 features) at threshold >= 0.80.
+5. Preserves all qualifying one-to-many matches.
+6. Memory-safe streaming batch architecture.
+"""
+
+import gc
+import os
+import sys
+import time
+from pathlib import Path
+from collections import defaultdict
+import numpy as np
 import pandas as pd
+import lightgbm as lgb
 from rapidfuzz import fuzz, process
 
-from similarity_features import calculate_features
-
+sys.path.insert(0, str(Path(__file__).parent))
+from normalization import (
+    normalize_business_name,
+    normalize_address,
+    normalize_compact,
+    normalize_tokens,
+    extract_digits,
+)
 
 # ============================================================
 # CONFIG
 # ============================================================
 
 BASE_DIR = Path(r"D:\Amazon ML Challenge")
-
-DATASET_DIR = BASE_DIR / "dataset"
+DATASET_DIR = BASE_DIR / "dataset" / "test"
 MODEL_FILE = BASE_DIR / "models" / "entity_matcher.txt"
-
-S1_FILE = DATASET_DIR / "test" / "test_source1.tsv"
-S2_FILE = DATASET_DIR / "test" / "test_source2.tsv"
-
+GATE_FILE = BASE_DIR / "models" / "fast_candidate_gate.txt"
 OUTPUT_DIR = BASE_DIR / "output"
-OUTPUT_FILE = OUTPUT_DIR / "s2_matches_test.csv"
 
-THRESHOLD = 0.80
+S1_FILE = DATASET_DIR / "test_source1.tsv"
+S2_FILE = DATASET_DIR / "test_source2.tsv"
+S3_FILE = DATASET_DIR / "test_source3.tsv"
 
-# SAFETY RUN ONLY
-MAX_SOURCE2_ROWS = 10_000
-
-# Cheap first-stage name filter.
-# Address12 candidates are NOT filtered.
+GATE_THRESHOLD = 0.10
+MAIN_THRESHOLD = 0.80
 NAME_PREFILTER_SCORE = 35.0
 
-# Number of feature rows sent to LightGBM at once.
-FEATURE_BATCH_SIZE = 10_000
-
-
-FEATURES = [
-    "name_token_sort",
-    "name_token_set",
-    "name_character",
-    "name_partial",
-    "name_jaccard",
-    "address_token_sort",
-    "address_token_set",
-    "address_character",
-    "address_partial",
-    "address_jaccard",
-    "address_digit_similarity",
-    "country_match",
-]
-
+# Batch size for model inference
+BATCH_SIZE = 25_000
 
 # ============================================================
-# BLOCK NORMALIZATION
+# LOAD MODELS & S1
 # ============================================================
 
-def block_normalize(value):
-    if pd.isna(value):
-        return ""
-
-    value = str(value).lower().strip()
-
-    chars = []
-    previous_space = False
-
-    for ch in value:
-        if ch.isalnum():
-            chars.append(ch)
-            previous_space = False
-        else:
-            if not previous_space:
-                chars.append(" ")
-                previous_space = True
-
-    return "".join(chars).strip()
-
-
-def compact_name(value):
-    return block_normalize(value).replace(" ", "")
-
-
-def make_name_key(country, name):
-    name_norm = block_normalize(name)
-
-    if not name_norm:
-        return None
-
-    return f"{str(country).lower().strip()}|{name_norm[:2]}"
-
-
-def make_address_key(country, address):
-    address_norm = block_normalize(address)
-
-    if not address_norm:
-        return None
-
-    return f"{str(country).lower().strip()}|{address_norm[:12]}"
-
-
-# ============================================================
-# MODEL
-# ============================================================
-
-print("=" * 70)
-print("LOADING MODEL")
-print("=" * 70)
-
-model = lgb.Booster(model_file=str(MODEL_FILE))
-
-print("Model loaded.")
-print("Threshold:", THRESHOLD)
-print("Name prefilter:", NAME_PREFILTER_SCORE)
-
-
-# ============================================================
-# LOAD TEST SOURCE 1
-# ============================================================
-
-print()
-print("=" * 70)
-print("LOADING TEST SOURCE 1")
-print("=" * 70)
-
-s1 = pd.read_csv(
-    S1_FILE,
-    sep="\t",
-    dtype=str,
-    keep_default_na=False
-)
-
-print("S1 rows:", len(s1))
-
-
-# Convert columns to lists.
-# Indexes will store integer positions instead of duplicating
-# complete source-1 records.
-
-s1_ids = s1["entity_id"].tolist()
-s1_names = s1["business_name"].tolist()
-s1_addresses = s1["business_address"].tolist()
-s1_countries = s1["country"].tolist()
-
-
-# ============================================================
-# BUILD BLOCK INDEXES
-# ============================================================
-
-print()
-print("=" * 70)
-print("BUILDING BLOCK INDEXES")
-print("=" * 70)
-
-name_index = {}
-address_index = {}
-
-for pos in range(len(s1_ids)):
-
-    country = s1_countries[pos]
-    name = s1_names[pos]
-    address = s1_addresses[pos]
-
-    # -------------------------
-    # NAME2 INDEX
-    # -------------------------
-
-    name_key = make_name_key(country, name)
-
-    if name_key is not None:
-
-        if name_key not in name_index:
-            name_index[name_key] = ([], [])
-
-        name_names, name_positions = name_index[name_key]
-
-        name_names.append(compact_name(name))
-        name_positions.append(pos)
-
-    # -------------------------
-    # ADDRESS12 INDEX
-    # -------------------------
-
-    address_key = make_address_key(country, address)
-
-    if address_key is not None:
-
-        if address_key not in address_index:
-            address_index[address_key] = []
-
-        address_index[address_key].append(pos)
-
-
-print("Name blocks   :", len(name_index))
-print("Address blocks:", len(address_index))
-
-
-# ============================================================
-# LOAD TEST SOURCE 2
-# ============================================================
-
-print()
-print("=" * 70)
-print("LOADING TEST SOURCE 2")
-print("=" * 70)
-
-s2 = pd.read_csv(
-    S2_FILE,
-    sep="\t",
-    dtype=str,
-    keep_default_na=False,
-    nrows=MAX_SOURCE2_ROWS
-)
-
-print("S2 rows for safety run:", len(s2))
-
-
-# ============================================================
-# OUTPUT SETUP
-# ============================================================
-
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-if OUTPUT_FILE.exists():
-    OUTPUT_FILE.unlink()
-
-output_started = False
-
-
-def write_matches(rows):
-    global output_started
-
-    if not rows:
-        return
-
-    df = pd.DataFrame(
-        rows,
-        columns=[
-            "source1_entity_id",
-            "source2_entity_id",
-            "score",
-        ]
-    )
-
-    df.to_csv(
-        OUTPUT_FILE,
-        mode="a",
-        header=not output_started,
-        index=False
-    )
-
-    output_started = True
-
-
-# ============================================================
-# PREDICTION BATCH
-# ============================================================
-
-feature_buffer = []
-pair_buffer = []
-
-total_model_candidates = 0
-total_matches = 0
-prediction_batch = 0
-
-
-def run_prediction_batch():
-    global total_matches
-    global prediction_batch
-
-    if not feature_buffer:
-        return
-
-    prediction_batch += 1
-
-    X = pd.DataFrame(feature_buffer)
-
-    X = X[FEATURES]
-
-    probabilities = model.predict(X)
-
-    accepted = []
-
-    for i, probability in enumerate(probabilities):
-
-        if probability >= THRESHOLD:
-
-            s2_id, s1_pos = pair_buffer[i]
-
-            accepted.append(
-                (
-                    s1_ids[s1_pos],
-                    s2_id,
-                    float(probability)
-                )
-            )
-
-    if accepted:
-        write_matches(accepted)
-
-        total_matches += len(accepted)
-
-    print(
-        f"Prediction batch {prediction_batch}: "
-        f"{len(feature_buffer):,} candidates | "
-        f"{len(accepted):,} matches"
-    )
-
-    feature_buffer.clear()
-    pair_buffer.clear()
-
-    del X
-    del probabilities
-    del accepted
-
+def init_pipeline():
+    print("=" * 65, flush=True)
+    print("INITIALIZING PREDICTION PIPELINE", flush=True)
+    print("=" * 65, flush=True)
+
+    t0 = time.time()
+    main_model = lgb.Booster(model_file=str(MODEL_FILE))
+    gate_model = lgb.Booster(model_file=str(GATE_FILE))
+    print(f"Models loaded in {time.time()-t0:.2f}s", flush=True)
+    print(f"  Fast gate threshold : {GATE_THRESHOLD:.2f}", flush=True)
+    print(f"  Main model threshold: {MAIN_THRESHOLD:.2f}", flush=True)
+
+    t0 = time.time()
+    print("\nLoading test_source1.tsv...", flush=True)
+    s1 = pd.read_csv(S1_FILE, sep="\t", dtype=str, keep_default_na=False)
+    s1_rows = len(s1)
+    print(f"Loaded {s1_rows:,} S1 rows in {time.time()-t0:.2f}s", flush=True)
+
+    t0 = time.time()
+    print("Pre-normalizing S1 representations...", flush=True)
+    s1_ids = s1["entity_id"].tolist()
+    s1_countries = [c.strip().lower() for c in s1["country"]]
+    s1_norm_name = [normalize_business_name(x) for x in s1["business_name"]]
+    s1_compact_name = [normalize_compact(x) for x in s1["business_name"]]
+    s1_tokens_name = [set(normalize_tokens(x)) for x in s1["business_name"]]
+
+    s1_norm_addr = [normalize_address(x) for x in s1["business_address"]]
+    s1_compact_addr = [x.replace(" ", "") for x in s1_norm_addr]
+    s1_tokens_addr = [set(normalize_tokens(x)) for x in s1["business_address"]]
+    s1_digits_addr = [extract_digits(x) for x in s1["business_address"]]
+    print(f"S1 pre-normalized in {time.time()-t0:.2f}s", flush=True)
+
+    t0 = time.time()
+    print("Building blocking indexes (name2 & address12)...", flush=True)
+    name_index = {}
+    address_index = {}
+
+    for pos in range(s1_rows):
+        c = s1_countries[pos]
+        nm = s1_norm_name[pos]
+        ad = s1_norm_addr[pos]
+
+        if nm:
+            nk = (c, nm[:2])
+            if nk not in name_index:
+                name_index[nk] = ([], [])
+            name_index[nk][0].append(s1_compact_name[pos])
+            name_index[nk][1].append(pos)
+
+        if ad:
+            ak = (c, ad[:12])
+            address_index.setdefault(ak, []).append(pos)
+
+    for k in address_index:
+        address_index[k] = np.array(address_index[k], dtype=np.int32)
+
+    print(f"Indexes built: {len(name_index):,} name blocks, {len(address_index):,} addr blocks in {time.time()-t0:.2f}s", flush=True)
+
+    del s1
     gc.collect()
 
+    s1_data = {
+        "ids": s1_ids,
+        "countries": s1_countries,
+        "norm_name": s1_norm_name,
+        "compact_name": s1_compact_name,
+        "tokens_name": s1_tokens_name,
+        "norm_addr": s1_norm_addr,
+        "compact_addr": s1_compact_addr,
+        "tokens_addr": s1_tokens_addr,
+        "digits_addr": s1_digits_addr,
+        "name_index": name_index,
+        "address_index": address_index,
+    }
+
+    return main_model, gate_model, s1_data
 
 # ============================================================
-# MAIN PREDICTION LOOP
+# SOURCE PROCESSOR
 # ============================================================
 
-print()
-print("=" * 70)
-print("STARTING OPTIMIZED TEST PREDICTION")
-print("=" * 70)
+def process_source(
+    source_file,
+    source_name,
+    output_file,
+    main_model,
+    gate_model,
+    s1_data,
+    max_rows=None,
+    chunk_size=100_000,
+):
+    print("\n" + "=" * 65, flush=True)
+    print(f"PROCESSING {source_name}: {source_file.name}", flush=True)
+    if max_rows:
+        print(f"  Row limit: {max_rows:,}", flush=True)
+    print(f"  Output   : {output_file}", flush=True)
+    print("=" * 65, flush=True)
 
-print()
-print("IMPORTANT:")
-print("- Address12 candidates go directly to the model.")
-print("- Name2 candidates use a cheap RapidFuzz pre-filter.")
-print("- No top-1 selection is used.")
-print("- All qualifying matches >= 0.80 are retained.")
-print()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    if output_file.exists():
+        output_file.unlink()
 
+    s1_ids = s1_data["ids"]
+    s1_norm_name = s1_data["norm_name"]
+    s1_compact_name = s1_data["compact_name"]
+    s1_tokens_name = s1_data["tokens_name"]
+    s1_norm_addr = s1_data["norm_addr"]
+    s1_compact_addr = s1_data["compact_addr"]
+    s1_tokens_addr = s1_data["tokens_addr"]
+    s1_digits_addr = s1_data["digits_addr"]
+    name_index = s1_data["name_index"]
+    address_index = s1_data["address_index"]
 
-for row_number, row in enumerate(s2.itertuples(index=False), start=1):
+    total_source_rows = 0
+    total_raw_candidates = 0
+    total_gate_survivors = 0
+    total_matches = 0
 
-    s2_id = row.entity_id
-    s2_name = row.business_name
-    s2_address = row.business_address
-    s2_country = row.country
+    output_header_written = False
 
-    # --------------------------------------------------------
-    # ADDRESS12 CANDIDATES
-    # --------------------------------------------------------
+    fast_feature_buf = []
+    pair_buf = []  # (src_id, s1_pos, src_compact_name, src_norm_addr)
 
-    address_key = make_address_key(
-        s2_country,
-        s2_address
+    def flush_batch():
+        nonlocal total_gate_survivors, total_matches, output_header_written
+
+        if not fast_feature_buf:
+            return
+
+        X_fast = np.array(fast_feature_buf, dtype=np.float32)
+        gate_probs = gate_model.predict(X_fast)
+        survivors = np.where(gate_probs >= GATE_THRESHOLD)[0]
+        total_gate_survivors += len(survivors)
+
+        if len(survivors) > 0:
+            main_rows = []
+            surv_pairs = []
+
+            for s_idx in survivors:
+                src_id, s1_pos, src_c_nm, src_n_ad = pair_buf[s_idx]
+                surv_pairs.append((src_id, s1_pos))
+
+                s1_c_nm = s1_compact_name[s1_pos]
+                np_val = fuzz.partial_ratio(s1_c_nm, src_c_nm) if (s1_c_nm and src_c_nm) else 0.0
+
+                s1_n_ad = s1_norm_addr[s1_pos]
+                ap_val = fuzz.partial_ratio(s1_n_ad, src_n_ad) if (s1_n_ad and src_n_ad) else 0.0
+
+                f = X_fast[s_idx]
+                main_row = [
+                    f[0], f[1], f[2], np_val, f[3],
+                    f[4], f[5], f[6], ap_val, f[7],
+                    f[8], f[9]
+                ]
+                main_rows.append(main_row)
+
+            X_main = np.array(main_rows, dtype=np.float32)
+            main_probs = main_model.predict(X_main)
+
+            match_indices = np.where(main_probs >= MAIN_THRESHOLD)[0]
+            if len(match_indices) > 0:
+                total_matches += len(match_indices)
+                match_records = []
+                for m_idx in match_indices:
+                    src_id, s1_pos = surv_pairs[m_idx]
+                    match_records.append({
+                        "source1_entity_id": s1_ids[s1_pos],
+                        "matched_entity_id": src_id,
+                        "score": float(main_probs[m_idx]),
+                    })
+
+                df_matches = pd.DataFrame(match_records)
+                df_matches.to_csv(
+                    output_file,
+                    mode="a",
+                    sep=",",
+                    header=not output_header_written,
+                    index=False,
+                )
+                output_header_written = True
+
+        fast_feature_buf.clear()
+        pair_buf.clear()
+
+    t_start = time.time()
+    reader = pd.read_csv(
+        source_file,
+        sep="\t",
+        dtype=str,
+        keep_default_na=False,
+        chunksize=chunk_size,
     )
 
-    address_positions = address_index.get(
-        address_key,
-        []
-    )
+    for chunk in reader:
+        if max_rows and total_source_rows >= max_rows:
+            break
 
-    # Address candidates bypass the cheap name filter.
-    candidate_positions = set(address_positions)
+        if max_rows and total_source_rows + len(chunk) > max_rows:
+            chunk = chunk.iloc[:max_rows - total_source_rows]
 
-    # --------------------------------------------------------
-    # NAME2 CANDIDATES
-    # --------------------------------------------------------
+        src_ids = chunk["entity_id"].tolist()
+        src_countries = [c.strip().lower() for c in chunk["country"]]
+        src_norm_name = [normalize_business_name(x) for x in chunk["business_name"]]
+        src_compact_name = [normalize_compact(x) for x in chunk["business_name"]]
+        src_tokens_name = [set(normalize_tokens(x)) for x in chunk["business_name"]]
 
-    name_key = make_name_key(
-        s2_country,
-        s2_name
-    )
+        src_norm_addr = [normalize_address(x) for x in chunk["business_address"]]
+        src_compact_addr = [x.replace(" ", "") for x in src_norm_addr]
+        src_tokens_addr = [set(normalize_tokens(x)) for x in chunk["business_address"]]
+        src_digits_addr = [extract_digits(x) for x in chunk["business_address"]]
 
-    name_prefilter_survivors = 0
+        for i in range(len(src_ids)):
+            c = src_countries[i]
+            nm = src_norm_name[i]
+            c_nm = src_compact_name[i]
+            ad = src_norm_addr[i]
+            sid = src_ids[i]
 
-    if name_key is not None:
+            cand_set = set()
+            cand_nc = {}
 
-        name_bucket = name_index.get(name_key)
+            # Address12 candidates bypass name pre-filter
+            if ad and (c, ad[:12]) in address_index:
+                cand_set.update(address_index[(c, ad[:12])])
 
-        if name_bucket is not None:
+            # Name2 candidates with C++ RapidFuzz pre-filter
+            if nm and c_nm and (c, nm[:2]) in name_index:
+                bucket_names, bucket_pos = name_index[(c, nm[:2])]
+                filtered = process.extract(c_nm, bucket_names, scorer=fuzz.ratio, score_cutoff=NAME_PREFILTER_SCORE, limit=None)
+                for _, score, local_idx in filtered:
+                    p = bucket_pos[local_idx]
+                    cand_set.add(p)
+                    cand_nc[p] = score
 
-            candidate_names, candidate_positions_list = name_bucket
+            if not cand_set:
+                total_source_rows += 1
+                continue
 
-            query_name = compact_name(s2_name)
+            total_raw_candidates += len(cand_set)
 
-            if query_name:
+            s2_tok_nm = src_tokens_name[i]
+            s2_c_nm = c_nm
+            s2_n_nm = nm
+            s2_n_ad = ad
+            s2_c_ad = src_compact_addr[i]
+            s2_tok_ad = src_tokens_addr[i]
+            s2_dig = src_digits_addr[i]
 
-                filtered = process.extract(
-                    query_name,
-                    candidate_names,
-                    scorer=fuzz.ratio,
-                    score_cutoff=NAME_PREFILTER_SCORE,
-                    limit=None
+            for s1_pos in cand_set:
+                s1_n_nm = s1_norm_name[s1_pos]
+                s1_tok_nm = s1_tokens_name[s1_pos]
+                s1_c_nm = s1_compact_name[s1_pos]
+                s1_n_ad = s1_norm_addr[s1_pos]
+                s1_c_ad = s1_compact_addr[s1_pos]
+                s1_tok_ad = s1_tokens_addr[s1_pos]
+                s1_dig = s1_digits_addr[s1_pos]
+
+                # Fast name features with fast-path equality checks
+                if s1_n_nm == s2_n_nm:
+                    nts = 100.0 if s1_n_nm else 0.0
+                    ntset = 100.0 if s1_n_nm else 0.0
+                    nc = 100.0 if s1_n_nm else 0.0
+                    nj = 1.0 if s1_n_nm else 0.0
+                else:
+                    nts = fuzz.token_sort_ratio(s1_n_nm, s2_n_nm) if (s1_n_nm and s2_n_nm) else 0.0
+                    ntset = fuzz.token_set_ratio(s1_n_nm, s2_n_nm) if (s1_n_nm and s2_n_nm) else 0.0
+                    nc = cand_nc.get(s1_pos)
+                    if nc is None:
+                        nc = fuzz.ratio(s1_c_nm, s2_c_nm) if (s1_c_nm and s2_c_nm) else 0.0
+                    nj = len(s1_tok_nm & s2_tok_nm) / len(s1_tok_nm | s2_tok_nm) if (s1_tok_nm and s2_tok_nm) else 0.0
+
+                # Fast address features with fast-path equality checks
+                if s1_n_ad == s2_n_ad:
+                    ats = 100.0 if s1_n_ad else 0.0
+                    atset = 100.0 if s1_n_ad else 0.0
+                    ac = 100.0 if s1_n_ad else 0.0
+                    aj = 1.0 if s1_n_ad else 0.0
+                else:
+                    ats = fuzz.token_sort_ratio(s1_n_ad, s2_n_ad) if (s1_n_ad and s2_n_ad) else 0.0
+                    atset = fuzz.token_set_ratio(s1_n_ad, s2_n_ad) if (s1_n_ad and s2_n_ad) else 0.0
+                    ac = fuzz.ratio(s1_c_ad, s2_c_ad) if (s1_c_ad and s2_c_ad) else 0.0
+                    aj = len(s1_tok_ad & s2_tok_ad) / len(s1_tok_ad | s2_tok_ad) if (s1_tok_ad and s2_tok_ad) else 0.0
+
+                # Digits
+                if s1_dig == s2_dig:
+                    ds = 100.0 if s1_dig else 0.0
+                else:
+                    ds = fuzz.ratio(s1_dig, s2_dig) if (s1_dig and s2_dig) else 0.0
+
+                cm = 1.0
+
+                fast_feature_buf.append([
+                    nts, ntset, nc, nj,
+                    ats, atset, ac, aj,
+                    ds, cm
+                ])
+                pair_buf.append((sid, s1_pos, s2_c_nm, s2_n_ad))
+
+                if len(fast_feature_buf) >= BATCH_SIZE:
+                    flush_batch()
+
+            total_source_rows += 1
+            if total_source_rows % 1_000 == 0:
+                elapsed = time.time() - t_start
+                rate = total_source_rows / max(elapsed, 0.01)
+                print(
+                    f"  {source_name} rows: {total_source_rows:,} | "
+                    f"Candidates: {total_raw_candidates:,} | "
+                    f"Gate survivors: {total_gate_survivors:,} | "
+                    f"Matches: {total_matches:,} | "
+                    f"Rate: {rate:.1f} rows/s ({elapsed:.1f}s)",
+                    flush=True
                 )
 
-                for _, score, local_index in filtered:
+    flush_batch()
+    total_elapsed = time.time() - t_start
 
-                    s1_position = candidate_positions_list[local_index]
+    print("\n" + "=" * 65, flush=True)
+    print(f"{source_name} COMPLETED IN {total_elapsed:.2f}s", flush=True)
+    print("=" * 65, flush=True)
+    print(f"Total {source_name} rows processed : {total_source_rows:,}", flush=True)
+    print(f"Total raw candidates generated     : {total_raw_candidates:,}", flush=True)
+    print(f"Gate survivors (>= {GATE_THRESHOLD:.2f})           : {total_gate_survivors:,} ({total_gate_survivors/max(total_raw_candidates,1)*100:.2f}%)", flush=True)
+    print(f"Final matches  (>= {MAIN_THRESHOLD:.2f})           : {total_matches:,}", flush=True)
+    print(f"Average throughput                 : {total_source_rows/max(total_elapsed, 0.01):.1f} rows/s", flush=True)
+    print(f"Output saved to                    : {output_file}", flush=True)
 
-                    candidate_positions.add(s1_position)
+    return total_source_rows, total_matches, total_elapsed
 
-                    name_prefilter_survivors += 1
+if __name__ == "__main__":
+    main_model, gate_model, s1_data = init_pipeline()
+    
+    # Check command-line arguments for test limits
+    limit = 1000
+    if len(sys.argv) > 1:
+        arg = sys.argv[1].lower()
+        if arg == "full":
+            limit = None
+        else:
+            limit = int(sys.argv[1])
 
-    # --------------------------------------------------------
-    # NO CANDIDATES
-    # --------------------------------------------------------
-
-    if not candidate_positions:
-        continue
-
-    # --------------------------------------------------------
-    # FULL MODEL FEATURES
-    # --------------------------------------------------------
-
-    for s1_position in candidate_positions:
-
-        features = calculate_features(
-            s1_names[s1_position],
-            s1_addresses[s1_position],
-            s1_countries[s1_position],
-            s2_name,
-            s2_address,
-            s2_country
-        )
-
-        feature_buffer.append(features)
-
-        pair_buffer.append(
-            (
-                s2_id,
-                s1_position
-            )
-        )
-
-        total_model_candidates += 1
-
-        if len(feature_buffer) >= FEATURE_BATCH_SIZE:
-            run_prediction_batch()
-
-    # --------------------------------------------------------
-    # PROGRESS
-    # --------------------------------------------------------
-
-    if row_number % 500 == 0:
-
-        print(
-            f"Processed S2 rows: {row_number:,} / {len(s2):,} | "
-            f"Model candidates: {total_model_candidates:,} | "
-            f"Matches: {total_matches:,}"
-        )
-
-
-# ============================================================
-# FINAL BATCH
-# ============================================================
-
-run_prediction_batch()
-
-
-# ============================================================
-# FINAL REPORT
-# ============================================================
-
-print()
-print("=" * 70)
-print("OPTIMIZED TEST PREDICTION COMPLETE")
-print("=" * 70)
-
-print("S2 rows processed     :", len(s2))
-print("Model candidates      :", f"{total_model_candidates:,}")
-print("Matches >= 0.80       :", f"{total_matches:,}")
-print("Output file            :", OUTPUT_FILE)
-
-if OUTPUT_FILE.exists():
-    print("Output size (MB)       :",
-          round(OUTPUT_FILE.stat().st_size / (1024 * 1024), 2))
-
-print()
-print("This was a 10K safety run.")
-print("Do NOT scale to the full test set yet.")
+    s2_out = OUTPUT_DIR / "s2_matches_test.csv"
+    process_source(
+        S2_FILE, "S2", s2_out,
+        main_model, gate_model, s1_data,
+        max_rows=limit
+    )
